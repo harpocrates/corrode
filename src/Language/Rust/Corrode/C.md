@@ -850,7 +850,7 @@ the result of the function, this generated block never has a final
 expression.
 
 ```haskell
-        let block = Rust.Block (toBlock body') Nothing
+        let block = Rust.Block body' Nothing
         let attrs = [Rust.Attribute "no_mangle"]
         return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) block))
 ```
@@ -877,7 +877,7 @@ a statement in C is almost always an expression instead in Rust. So
 expression.
 
 ```haskell
-interpretStatement :: CStat -> EnvMonad Rust.Expr
+interpretStatement :: CStat -> EnvMonad [Rust.Stmt]
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -888,7 +888,7 @@ If the statement is empty, as in just a semicolon, we can produce an empty
 block.
 
 ```haskell
-interpretStatement (CExpr Nothing _) = return (Rust.BlockExpr (Rust.Block [] Nothing))
+interpretStatement (CExpr Nothing _) = return []
 ```
 
 Otherwise, the first argument to `interpretExpr` indicates whether the
@@ -898,7 +898,7 @@ expression, the result is discarded, so we pass `False`.
 ```haskell
 interpretStatement (CExpr (Just expr) _) = do
     expr' <- interpretExpr False expr
-    return (result expr')
+    return [Rust.Stmt (result expr')]
 ```
 
 We could have a "compound statement", also known as a "block". A
@@ -906,9 +906,10 @@ compound statement contains a sequence of zero or more statements or
 declarations; see `interpretBlockItem` below for details.
 
 ```haskell
+interpretStatement (CCompound [] [] _) = return []
 interpretStatement (CCompound [] items _) = scope $ do
     stmts <- mapM interpretBlockItem items
-    return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
+    return [Rust.Stmt (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))]
 ```
 
 This statement could be an `if` statement, with its conditional
@@ -928,9 +929,9 @@ original program used a compound statement in that branch or not.
 ```haskell
 interpretStatement (CIf c t mf _) = do
     c' <- interpretExpr True c
-    t' <- fmap toBlock (interpretStatement t)
-    f' <- maybe (return []) (fmap toBlock . interpretStatement) mf
-    return (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
+    t' <- interpretStatement t
+    f' <- maybe (return []) interpretStatement mf
+    return [Rust.Stmt (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))]
 ```
 
 `while` loops are easy to translate from C to Rust. They have identical
@@ -942,7 +943,7 @@ loop body must be a block.
 interpretStatement (CWhile c b False _) = do
     c' <- interpretExpr True c
     (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-    return (Rust.While Nothing (toBool c') (Rust.Block (toBlock b') Nothing))
+    return [Rust.Stmt (Rust.While Nothing (toBool c') (Rust.Block b' Nothing))]
 ```
 
 C's `for` loops can be tricky to translate to Rust, which doesn't have
@@ -1000,10 +1001,10 @@ so that they refer to the outer loop, not the one we inserted.
             incr' <- (toBlock . result) <$> interpretExpr False incr
 
             let loop = Rust.Loop continueTo $
-                         Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
+                         Rust.Block (b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
             return ( if getAny br then breakTo else Nothing
-                   , if getAny co then [Rust.Stmt loop] ++ incr' else [Rust.Stmt b'] ++ incr' )
+                   , if getAny co then [Rust.Stmt loop] ++ incr' else [ Rust.Stmt (Rust.BlockExpr (Rust.Block b' Nothing)) ] ++ incr' )
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -1014,7 +1015,7 @@ expressions, with no magic loops inserted into the body.
 ```haskell
         Nothing -> do
             (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-            return (Nothing, toBlock b')
+            return (Nothing, b')
 ```
 
 If the condition is empty, the loop should translate to Rust's infinite
@@ -1035,7 +1036,9 @@ Now we have all the pieces to assemble a Rust equivalent to the original
 with the selected variety of loop.
 
 ```haskell
-    return (Rust.BlockExpr (Rust.Block pre (Just loop)))
+    return $ case initial of
+        Left _ -> pre ++ [Rust.Stmt loop]
+        Right _ -> [Rust.Stmt (Rust.BlockExpr (Rust.Block pre (Just loop)))]
 ```
 
 `continue` and `break` statements translate to whatever expression we
@@ -1044,8 +1047,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = recordContinue >> getFlow stmt onContinue
-interpretStatement stmt@(CBreak _) = recordBreak >> getFlow stmt onBreak
+interpretStatement stmt@(CCont _) = recordContinue >> pure . Rust.Stmt <$> getFlow stmt onContinue
+interpretStatement stmt@(CBreak _) = recordBreak >> pure . Rust.Stmt <$> getFlow stmt onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1059,7 +1062,7 @@ type.
 interpretStatement stmt@(CReturn expr _) = do
     retTy <- getFlow stmt functionReturnType
     expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-    return (Rust.Return expr')
+    return [Rust.Stmt (Rust.Return expr')]
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -1108,9 +1111,7 @@ of zero or more Rust statements for each compound block item.
 
 ```haskell
 interpretBlockItem :: CBlockItem -> EnvMonad [Rust.Stmt]
-interpretBlockItem (CBlockStmt stmt) = do
-    stmt' <- interpretStatement stmt
-    return [Rust.Stmt stmt']
+interpretBlockItem (CBlockStmt stmt) = interpretStatement stmt
 interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem item = unimplemented item
 ```
