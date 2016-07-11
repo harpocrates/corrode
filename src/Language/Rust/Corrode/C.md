@@ -839,7 +839,7 @@ Interpret the body of the function. `language-c` guarantees that type of
 of `interpretStatement` to avoid having and extra set of braces.
 
 ```haskell
-        [Rust.Stmt (Rust.BlockExpr block)] <- interpretStatement body
+        body' <- interpretStatement body
 ```
 
 Since C doesn't have Rust's syntax allowing the last expression to be
@@ -848,7 +848,7 @@ expression.
 
 ```haskell
         let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) block))
+        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) (statementsToBlock body')))
 ```
 
 
@@ -905,8 +905,8 @@ usual rule of not simplifying the generated rust and simply ignore the
 ```haskell
 interpretStatement (CCompound [] [] _) = return []
 interpretStatement (CCompound [] items _) = scope $ do
-    stmts <- mapM interpretBlockItem items
-    return [Rust.Stmt (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))]
+    stmts <- concat <$> mapM interpretBlockItem items
+    return [Rust.Stmt (Rust.BlockExpr (statementsToBlock stmts))]
 ```
 
 This statement could be an `if` statement, with its conditional
@@ -930,7 +930,7 @@ interpretStatement (CIf c t mf _) = do
             Nothing -> return []
             Just (CCompound [] items _) -> concat <$> mapM interpretBlockItem items
             Just f' -> interpretStatement f'
-    return [Rust.Stmt (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))]
+    return [Rust.Stmt (Rust.IfThenElse (toBool c') (statementsToBlock t') (statementsToBlock f'))]
 ```
 
 `while` loops are easy to translate from C to Rust. They have identical
@@ -997,7 +997,7 @@ so that they refer to the outer loop, not the one we inserted.
             let continueTo = Just (Rust.Lifetime continueName)
 
             (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
-            incr' <- (toBlock . result) <$> interpretExpr False incr
+            incr' <- exprToStatements <$> interpretExpr False incr
 
             let loop = Rust.Loop continueTo $
                          Rust.Block (b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
@@ -1115,17 +1115,27 @@ interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem item = unimplemented item
 ```
 
-`toBlock` is a helper function which turns a Rust expression into a list
-of Rust statements. It's always possible to do this by wrapping the
-expression in the `Rust.Stmt` constructor, but there are a bunch of
-places in this translation where we don't want to have to think about
-whether the expression is already a block expression to avoid inserting
-excess pairs of curly braces everywhere.
+`exprToStatements` is a helper function which turns a Rust expression
+result into a list of Rust statements. It's always possible to do this by
+extracting the expression and wrapping it in the `Rust.Stmt` constructor,
+but there are a bunch of places in this translation where we don't want to
+have to think about whether the expression is already a block expression to
+avoid inserting excess pairs of curly braces everywhere.
 
 ```haskell
-toBlock :: Rust.Expr -> [Rust.Stmt]
-toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
-toBlock e = [Rust.Stmt e]
+exprToStatements :: Result -> [Rust.Stmt]
+exprToStatements Result{ result = Rust.BlockExpr (Rust.Block stmts Nothing) } = stmts
+exprToStatements Result{ result = e } = [Rust.Stmt e]
+```
+`statementsToBlock` is a similar helper function which turns a list of
+Rust statements into a block. As before, this can always be done with the
+`Rust.Block` constructor, but again this is a convenient way to avoid
+inserting excess pairs of curly braces everywhere.
+
+```haskell
+statementsToBlock :: [Rust.Stmt] -> Rust.Block
+statementsToBlock [Rust.Stmt (Rust.BlockExpr block)] = block
+statementsToBlock stmts = Rust.Block stmts Nothing
 ```
 
 `scope` runs the translation steps in `m`, but then throws away any
@@ -1233,7 +1243,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
         else return Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
-            , result = Rust.IfThenElse c' (Rust.Block (toBlock (result t')) Nothing) (Rust.Block (toBlock (result f')) Nothing)
+            , result = Rust.IfThenElse c' (Rust.Block (exprToStatements t') Nothing) (Rust.Block (exprToStatements f') Nothing)
             }
 ```
 
