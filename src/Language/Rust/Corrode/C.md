@@ -833,24 +833,20 @@ Add each formal parameter into the new environment, tagged as
             ]
 ```
 
-Interpret the body of the function.
+Interpret the body of the function. `language-c` guarantees that type of
+`body` is `CStatement` and that it is specifically a compound statement
+(the `CCompound` constructor) which means we must pattern match on the output
+of `interpretStatement` to avoid having and extra set of braces.
 
 ```haskell
-        body' <- interpretStatement body
+        [Rust.Stmt (Rust.BlockExpr block)] <- interpretStatement body
 ```
-
-The body's Haskell type is `CStatement`, but language-c guarantees that
-it is specifically a compound statement (the `CCompound` constructor).
-Rather than relying on that, we allow it to be any kind of statement and
-use `toBlock` to coerce the resulting Rust expression into a list of
-Rust statements, and wrap that up in a Rust block.
 
 Since C doesn't have Rust's syntax allowing the last expression to be
 the result of the function, this generated block never has a final
 expression.
 
 ```haskell
-        let block = Rust.Block body' Nothing
         let attrs = [Rust.Attribute "no_mangle"]
         return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) block))
 ```
@@ -871,10 +867,10 @@ data ControlFlow = ControlFlow
     }
 ```
 
-Inside a function, we find C statements. Interestingly, syntax which is
-a statement in C is almost always an expression instead in Rust. So
-`interpretStatement` transforms one `CStatement` into one Rust
-expression.
+Inside a function, we find C statements. Although syntax which is
+a statement in C is almost always an expression instead in Rust, for the
+purpose of simplifying statements (especially loops) `interpretStatement`
+transforms one `CStatement` into a list of Rust expressions.
 
 ```haskell
 interpretStatement :: CStat -> EnvMonad [Rust.Stmt]
@@ -883,9 +879,6 @@ interpretStatement :: CStat -> EnvMonad [Rust.Stmt]
 A C statement might be as simple as a "statement expression", which
 amounts to a C expression followed by a semicolon. In that case we can
 translate the statement by just translating the expression.
-
-If the statement is empty, as in just a semicolon, we can produce an empty
-block.
 
 ```haskell
 interpretStatement (CExpr Nothing _) = return []
@@ -904,6 +897,10 @@ interpretStatement (CExpr (Just expr) _) = do
 We could have a "compound statement", also known as a "block". A
 compound statement contains a sequence of zero or more statements or
 declarations; see `interpretBlockItem` below for details.
+
+In the case of an empty compound statement, we make an exception of our
+usual rule of not simplifying the generated rust and simply ignore the
+"statement".
 
 ```haskell
 interpretStatement (CCompound [] [] _) = return []
@@ -1004,7 +1001,7 @@ so that they refer to the outer loop, not the one we inserted.
                          Rust.Block (b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
             return ( if getAny br then breakTo else Nothing
-                   , if getAny co then [Rust.Stmt loop] ++ incr' else [ Rust.Stmt (Rust.BlockExpr (Rust.Block b' Nothing)) ] ++ incr' )
+                   , if getAny co then [Rust.Stmt loop] ++ incr' else b' ++ incr' )
 ```
 
 We can generate simpler code in the special case that this `for` loop
