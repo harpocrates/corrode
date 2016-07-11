@@ -919,15 +919,17 @@ if necessary.
 In C, the "then" and "else" branches are each statements (which may be
 compound statements, if they're surrounded by curly braces), but in Rust
 they must each be blocks (so they're always surrounded by curly braces).
-Here we use `toBlock` to coerce both branches into lists of statements,
-and wrap those lists up into blocks, so we don't care whether the
-original program used a compound statement in that branch or not.
 
 ```haskell
 interpretStatement (CIf c t mf _) = do
     c' <- interpretExpr True c
-    t' <- interpretStatement t
-    f' <- maybe (return []) interpretStatement mf
+    t' <- case t of
+            CCompound [] items _ -> concat <$> mapM interpretBlockItem items
+            _ -> interpretStatement t
+    f' <- case mf of
+            Nothing -> return []
+            Just (CCompound [] items _) -> concat <$> mapM interpretBlockItem items
+            Just f' -> interpretStatement f'
     return [Rust.Stmt (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))]
 ```
 
