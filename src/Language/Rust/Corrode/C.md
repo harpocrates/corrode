@@ -104,6 +104,7 @@ data IdentKind
     = SymbolIdent { identOfKind :: Ident }
     | TypedefIdent { identOfKind :: Ident }
     | StructIdent { identOfKind :: Ident }
+    | UnionIdent { identOfKind :: Ident }
     | EnumIdent { identOfKind :: Ident }
     deriving Eq
 ```
@@ -2125,6 +2126,7 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
     fields <- case resultType obj' of
         IsStruct _ fields -> return fields
+        IsUnion _ fields -> return fields
         IsIncomplete tyIdent -> do
             (_, struct) <- getIdent (StructIdent tyIdent)
             case struct of
@@ -2770,6 +2772,7 @@ data CType
     | IsFunc CType [(Maybe (Rust.Mutable, Ident), CType)] Bool
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
+    | IsUnion String [(String, CType)]
     | IsEnum String
     | IsIncomplete Ident
     deriving Show
@@ -2835,6 +2838,7 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
+toRustType (IsUnion name _fields) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
 toRustType (IsIncomplete ident) = Rust.TypeName (identToString ident)
 ```
@@ -2889,13 +2893,15 @@ baseTypeOf specs = do
     go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
-    go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        (_name, mty) <- getIdent (StructIdent ident)
+    go (CSUType (CStruct structTag (Just ident) Nothing _ _) _) (mut, _) = do
+        (_name, mty) <- getIdent $ case structTag of
+            CStructTag -> StructIdent ident
+            CUnionTag -> UnionIdent ident
         ty <- case mty of
             Just (_, ty) -> return ty
             Nothing -> emitIncomplete ident
         return (mut, ty)
-    go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
+    go (CSUType (CStruct structTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
             (storage, base) <- baseTypeOf spec
             case storage of
@@ -2908,22 +2914,21 @@ baseTypeOf specs = do
                     return (identToString field, ty)
                 (_, Nothing, Just _size) -> unimplemented declaration
                 _ -> badSource declaration "field in struct"
-        name <- case mident of
-            Just ident -> do
+        name <- case (mident,structTag) of
+            (Just ident, CStructTag) -> do
                 let name = identToString ident
                 addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
-            Nothing -> uniqueName "Struct"
+            (Just ident, CUnionTag) -> do
+                let name = identToString ident
+                addIdent (UnionIdent ident) (Rust.Immutable, IsUnion name fields)
+            (Nothing, CStructTag) -> uniqueName "Struct"
+            (Nothing, CUnionTag) -> uniqueName "Union"
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
-        emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
-        return (mut, IsStruct name fields)
-    go (CSUType (CStruct CUnionTag mident _ _ _) node) (mut, _) = do
-        ident <- case mident of
-            Just ident -> return ident
-            Nothing -> do
-                name <- uniqueName "Union"
-                return (internalIdentAt (posOfNode node) name)
-        ty <- emitIncomplete ident
-        return (mut, ty)
+            (structOrUnion, typ) = case structTag of
+                CStructTag -> (Rust.Struct, IsStruct)
+                CUnionTag -> (Rust.Union, IsUnion)
+        emitItems [Rust.Item attrs Rust.Public (structOrUnion name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
+        return (mut, typ name fields)
     go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
         (_, mty) <- getIdent (EnumIdent ident)
         case mty of
