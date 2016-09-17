@@ -152,6 +152,7 @@ data Expr
     | Var Var
     | Path Path
     | StructExpr String [(String, Expr)] (Maybe Expr)
+    | UnionExpr String (String, Expr)
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
     | Lambda [Var] Expr
@@ -228,6 +229,8 @@ instance Pretty Expr where
             : punctuate (text ",") ([ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ] ++ maybe [] (\b -> [ text ".." <> pPrint b ]) base)
             ++ [text "}"]
             )
+        UnionExpr str (name, val) -> sep
+            [ text str <+> text "{", nest 4 (text name <> text ":" <+> pPrint val), text "}" ]
         Call f args -> cat
             ( pPrintPrec l 13 f <> text "("
             : punctuate (text ",") (map (nest 4 . pPrint) args)

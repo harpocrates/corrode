@@ -34,14 +34,15 @@ import Data.Char
 import Data.Foldable
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
-import Data.Monoid
+import Data.Monoid hiding ((<>))
+import Data.Semigroup
 import Data.List
 import qualified Data.Set as Set
 import Language.C
 import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
 import Numeric
-import Text.PrettyPrint
+import Text.PrettyPrint hiding ((<>))
 ```
 
 This translation proceeds in a syntax-directed way. That is, we just
@@ -847,36 +848,47 @@ get initialized to their zero-equivalent values.
 
 ```haskell
 data Initializer
-    = Initializer (Maybe Rust.Expr) (IntMap.IntMap Initializer)
-```
-
-```haskell
-scalar :: Rust.Expr -> Initializer
-scalar expr = Initializer (Just expr) IntMap.empty
+    = Scalar Rust.Expr
+    | Aggregate (Maybe Rust.Expr) (IntMap.IntMap Initializer)
+    | Union Int Initializer
 ```
 
 Notice that combining initializers is an associative binary operation.
-This motivates us to use the `Monoid` typeclass again to represent the
-operation for combining two initializers.
+However, there is really no such thing as an empty initializer (or rather
+we would need to know the type of what is being initialized to say what an
+empty initializer would look like). This motivates us to use the
+`Semigroup` typeclass to represent the operation for combining two
+initializers.
+
 
 ```haskell
-instance Monoid Initializer where
+instance Semigroup Initializer where
 ```
-- The identity element in this case will be the empty initializer. This is
-  because whenever it is combined with another initializer (either from
-  the left or the right), the result is just the other initializer.
+- Whenever there is a scalar expression on the right hand side, it
+overrides everything that came before it.
 
     ```haskell
-        mempty = Initializer Nothing IntMap.empty
+        _ <> Scalar e = Scalar e
+        Scalar e <> Aggregate m a = Aggregate (m `mplus` Just e) a
+        Scalar _ <> Union i a = Union i a
     ```
 
-- When combining two initializers, the one on the right overrides/shadows
-  definitions made by the one on the left.
+- For aggregate initializers, the one on the right overrides/shadows
+definitions made by the one on the left. For unions, this is even more
+restrictive: we only use information from the left intializer if both
+intializers are for the same union variant.
 
     ```haskell
-        mappend _ b@(Initializer (Just _) _) = b
-        mappend (Initializer m a) (Initializer Nothing b) =
-            Initializer m (IntMap.unionWith mappend a b)
+        Aggregate m1 a <> Aggregate m2 b = Aggregate (m2 `mplus` m1) (if null m2 then IntMap.unionWith (<>) a b else b)
+        Union i a <> Union j b = Union j (if i /= j then b else a <> b)
+    ```
+
+- Note that we should never be trying to combine an initializer for a union with
+one for an aggregate (and vice-versa). This case should be unreachable (even if
+we can't prove this in the type-system).
+
+    ```haskell
+        _ <> _ = error "Tried to merge initializers of incompatible types"
     ```
 
 Now, we need to concern ourselves with constructing these initializers in
@@ -899,12 +911,21 @@ data Designator
 * encodes the type of the object pointed to, its index in the parent,
   remaining fields in the parent, and the parent designator
 
-In several places, we need to know the type of a designated object.
+In several places, we need to know the type, as well as the chain of types,
+of a designated object. Another useful operation is to find the chain of
+(union or aggregate) indices that lead to a designated object.
 
 ```haskell
 designatorType :: Designator -> CType
-designatorType (Base ty) = ty
-designatorType (From ty _ _ _) = ty
+designatorType = head . designatorTypes
+
+designatorTypes :: Designator -> [CType]
+designatorTypes (Base ty) = [ty]
+designatorTypes (From ty _ _ desig) = ty : designatorTypes desig
+
+designatorIndices :: Designator -> [Int]
+designatorIndices (Base _) = []
+designatorIndices (From _ j _ desig) = j : designatorIndices desig
 ```
 
 Then, given a list of designators and the type we are currently in, we can
@@ -918,9 +939,10 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
 
     go :: CType -> [CDesignator] -> Designator -> EnvMonad Designator
     go _ [] obj = pure obj
-    go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
+    go (isStructOrUnion -> Just (name, fields, struct)) (d@(CMemberDesig ident _) : ds) obj = do
         case span (\ (field, _) -> identToString ident /= field) fields of
-            (_, []) -> badSource d ("designator for field not in struct " ++ name)
+            (_, []) -> let ty' = if struct then "struct" else "union"
+                       in badSource d (unwords [ "designator for field not in", ty', name ])
             (earlier, (_, ty') : rest) ->
                 go ty' ds (From ty' (length earlier) (map snd rest) obj)
     go ty' (d : _) _ = badSource d ("designator for " ++ show ty')
@@ -942,7 +964,7 @@ nextObject (From _ _ [] base) = nextObject base
 The type of an initializer expression is compatible with the type of the
 object it's initializing if either:
 
-- Both have structure type and they're the same `struct`,
+- Both have structure type and they're the same `struct` or `union`,
 - Or neither have structure type.
 
 In the latter case we don't check what type they are, because we can
@@ -953,6 +975,9 @@ compatibleInitializer :: CType -> CType -> Bool
 compatibleInitializer (IsStruct name1 _) (IsStruct name2 _) = name1 == name2
 compatibleInitializer IsStruct{} _ = False
 compatibleInitializer _ IsStruct{} = False
+compatibleInitializer (IsUnion name1 _) (IsUnion name2 _) = name1 == name2
+compatibleInitializer IsUnion{} _ = False
+compatibleInitializer _ IsUnion{} = False
 compatibleInitializer _ _ = True
 ```
 
@@ -973,6 +998,8 @@ nestedObject ty desig = case designatorType desig of
     ty' | ty `compatibleInitializer` ty' -> Just desig
     IsStruct _ ((_ , ty') : fields) ->
         nestedObject ty (From ty' 0 (map snd fields) desig)
+    IsUnion _ ((_ , ty') : _) ->
+        nestedObject ty (From ty' 0 [] desig)
     _ -> Nothing
 ```
 
@@ -983,8 +1010,8 @@ When we have a list of expressions, we start by parsing all of the
 designators into our internal representation.
 
 ```haskell
-translateInitList :: CType -> CInitList -> EnvMonad Initializer
-translateInitList ty list = do
+translateInitList :: CType -> CInitList -> CInit -> EnvMonad Initializer
+translateInitList ty list n = do
 
     objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
         currObj <- objectFromDesignators ty desigs
@@ -997,19 +1024,22 @@ types it points to the primitive itself. For example
 
 ```c
 struct point { int x, y };
+union number { int i; long l; float f; }
 
 int i = { 1, 3 };
 struct point p = { 1, 3 };
+union number n = { 1, 3 };
 ```
 
 In the first example, the whole of `i` gets initialized to `1` (and `3` is
 ignored) since `i` is not a struct. On the other, in the second example,
 it is the fields of `p` that get initialized to `1` and `3` since `p` is a
-struct.
+struct. Finally, in the last example, only `i` gets initialized to `1`.
 
 ```haskell
     let base = case ty of
                     IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
+                    IsUnion _ ((_,ty'):_) -> From ty' 0 [] (Base ty)
                     _ -> Base ty
 ```
 
@@ -1023,8 +1053,10 @@ initializer lists never affect the current object of their enclosing
 initializer.
 
 ```haskell
-    (_, initializer) <- foldM resolveCurrentObject (Just base, mempty) objectsAndInitializers
-    return initializer
+    (_, initializerOpt) <- foldM resolveCurrentObject (Just base, mempty) objectsAndInitializers
+    case getOption initializerOpt of
+        Nothing -> badSource n "Empty intializer lists are not allowed"
+        Just initializer -> return initializer
 ```
 
 Resolution takes a current object to use if no designator is specified. It
@@ -1034,9 +1066,9 @@ initialized.
 
 ```haskell
 resolveCurrentObject
-    :: (CurrentObject, Initializer)
+    :: (CurrentObject, Option Initializer)
     -> (CurrentObject, CInit)
-    -> EnvMonad (CurrentObject, Initializer)
+    -> EnvMonad (CurrentObject, Option Initializer)
 resolveCurrentObject (obj0, prior) (obj1, cinitial) = case obj1 `mplus` obj0 of
     Nothing -> return (Nothing, prior)
     Just obj -> do
@@ -1051,7 +1083,7 @@ using `nestedObject`.
 ```haskell
         (obj', initial) <- case cinitial of
             CInitList list' _ -> do
-                initial <- translateInitList (designatorType obj) list'
+                initial <- translateInitList (designatorType obj) list' cinitial
                 return (obj, initial)
             CInitExpr expr _ -> do
                 expr' <- interpretExpr True expr
@@ -1059,7 +1091,7 @@ using `nestedObject`.
                     Nothing -> badSource cinitial "type in initializer"
                     Just obj' -> do
                         let s = castTo (designatorType obj') expr'
-                        return (obj', scalar s)
+                        return (obj', Scalar s)
 ```
 
 Now that we've settled on the right current object and constructed an
@@ -1067,12 +1099,15 @@ intermediate `Initializer` for it, we need to wrap the latter in a
 minimal aggregate initializer for each designator in the former.
 
 ```haskell
-        let indices = unfoldr (\o -> case o of
-                                 Base{} -> Nothing
-                                 From _ j _ p -> Just (j,p)) obj'
-        let initializer = foldl (\a j -> Initializer Nothing (IntMap.singleton j a)) initial indices
 
-        return (nextObject obj', prior `mappend` initializer)
+        let initializer = foldl
+                            (\a (ty,j) -> case ty of
+                                IsUnion{} -> Union j a
+                                _ -> Aggregate Nothing (IntMap.singleton j a))
+                            initial
+                            (tail (designatorTypes obj') `zip` designatorIndices obj')
+
+        return (nextObject obj', prior `mappend` pure initializer)
 ```
 
 Finally, we can implement the full `interpretInitializer` function we
@@ -1090,12 +1125,12 @@ interpretInitializer ty initial = do
         CInitExpr expr _ -> do
             expr' <- interpretExpr True expr
             if resultType expr' `compatibleInitializer` ty
-                then pure $ scalar (castTo ty expr')
+                then pure $ Scalar (castTo ty expr')
                 else badSource initial "initializer for incompatible type"
-        CInitList list _ -> translateInitList ty list
+        CInitList list _ -> translateInitList ty list initial
 
     zeroed <- zeroInitializer ty
-    case helper ty (zeroed `mappend` initial') of
+    case helper ty (zeroed <> initial') of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
 
@@ -1107,17 +1142,20 @@ initializes in a way that the underlying memory of the target is just
 zeroed out.
 
 ```haskell
-    zeroInitializer IsBool{} = return $ scalar (Rust.Lit (Rust.LitRep "false"))
+    zeroInitializer IsBool{} = return $ Scalar (Rust.Lit (Rust.LitRep "false"))
     zeroInitializer IsVoid{} = badSource initial "initializer for void"
-    zeroInitializer t@IsInt{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+    zeroInitializer t@IsInt{} = return $ Scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
         where Rust.TypeName s = toRustType t
-    zeroInitializer t@IsFloat{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+    zeroInitializer t@IsFloat{} = return $ Scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
         where Rust.TypeName s = toRustType t
-    zeroInitializer t@IsPtr{} = return $ scalar (Rust.Cast 0 (toRustType t))
-    zeroInitializer t@IsFunc{} = return $ scalar (Rust.Cast 0 (toRustType t))
+    zeroInitializer t@IsPtr{} = return $ Scalar (Rust.Cast 0 (toRustType t))
+    zeroInitializer t@IsFunc{} = return $ Scalar (Rust.Cast 0 (toRustType t))
     zeroInitializer (IsStruct _ fields) = do
         fields' <- mapM (zeroInitializer . snd) fields
-        return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
+        return (Aggregate Nothing (IntMap.fromList $ zip [0..] fields'))
+    zeroInitializer (IsUnion _ fields) = do
+        field <- zeroInitializer (snd (head fields))
+        return (Union 0 field)
     zeroInitializer IsEnum{} = unimplemented initial
     zeroInitializer (IsIncomplete ident) = do
         (_, struct) <- getIdent (StructIdent ident)
@@ -1128,11 +1166,19 @@ zeroed out.
 
 ```haskell
     helper :: CType -> Initializer -> Maybe Rust.Expr
-    helper _ (Initializer (Just expr) initials) | IntMap.null initials = Just expr
-    helper (IsStruct str fields) (Initializer expr initials) =
+    helper _ (Scalar expr) = Just expr
+    helper _ (Aggregate (Just expr) initials) | IntMap.null initials = Just expr
+    helper (IsStruct str fields) (Aggregate expr initials) =
         Rust.StructExpr str <$> fields' <*> pure expr
         where
         fields' = forM (IntMap.toList initials) $ \ (idx, value) -> do
+            (field, ty') <- listToMaybe (drop idx fields)
+            value' <- helper ty' value
+            Just (field, value')
+    helper (IsUnion str fields) (Union idx value) =
+        Rust.UnionExpr str <$> field'
+        where
+        field' = do
             (field, ty') <- listToMaybe (drop idx fields)
             value' <- helper ty' value
             Just (field, value')
@@ -2776,6 +2822,11 @@ data CType
     | IsEnum String
     | IsIncomplete Ident
     deriving Show
+
+isStructOrUnion :: CType -> Maybe (String, [(String, CType)], Bool)
+isStructOrUnion (IsStruct name fields) = Just (name, fields, True)
+isStructOrUnion (IsUnion name fields) = Just (name, fields, False)
+isStructOrUnion _ = Nothing
 ```
 
 Deriving a default implementation of the `Eq` typeclass for equality
