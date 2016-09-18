@@ -36,7 +36,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
 import Data.Monoid hiding ((<>))
 import Data.Semigroup
-import Data.List
+import Data.List hiding (union)
 import qualified Data.Set as Set
 import Language.C
 import Language.C.Data.Ident
@@ -466,6 +466,7 @@ don't derive `Copy` or `Clone` for it.
     completeTypes = Set.fromList $ catMaybes
         [ case item of
             Rust.Item _ _ (Rust.Struct name _) -> Just name
+            Rust.Item _ _ (Rust.Union name _) -> Just name
             _ -> Nothing
         | item <- outputItems output
         ]
@@ -508,6 +509,7 @@ those types aren't actually used.
 ```haskell
     neededTypes = Set.unions (usesTypes output : map declaredNames externTypes)
     keepItem (Rust.Item _ _ (Rust.Struct name _)) = name `Set.member` neededTypes
+    keepItem (Rust.Item _ _ (Rust.Union name _)) = name `Set.member` neededTypes
     keepItem (Rust.Item _ _ (Rust.Enum name _)) = name `Set.member` neededTypes
     keepItem _ = True
 
@@ -1159,8 +1161,10 @@ zeroed out.
     zeroInitializer IsEnum{} = unimplemented initial
     zeroInitializer (IsIncomplete ident) = do
         (_, struct) <- getIdent (StructIdent ident)
-        case struct of
+        (_, union) <- getIdent (UnionIdent ident)
+        case struct `mplus` union of
             Just (_, ty'@IsStruct{}) -> zeroInitializer ty'
+            Just (_, ty'@IsUnion{}) -> zeroInitializer ty'
             _ -> badSource initial "initialization of incomplete type"
 ```
 
@@ -2175,10 +2179,12 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
         IsUnion _ fields -> return fields
         IsIncomplete tyIdent -> do
             (_, struct) <- getIdent (StructIdent tyIdent)
-            case struct of
+            (_, union) <- getIdent (UnionIdent tyIdent)
+            case struct `mplus` union of
                 Just (_, IsStruct _ fields) -> return fields
+                Just (_, IsUnion _ fields) -> return fields
                 _ -> badSource expr "member access of incomplete type"
-        _ -> badSource expr "member access of non-struct"
+        _ -> badSource expr "member access of non-struct/union"
     let field = identToString ident
     ty <- case lookup field fields of
         Just ty -> return ty
@@ -2846,6 +2852,8 @@ instance Eq CType where
     IsPtr aMut aTy == IsPtr bMut bTy = aMut == bMut && aTy == bTy
     IsStruct aName aFields == IsStruct bName bFields =
         aName == bName && aFields == bFields
+    IsUnion aName aFields == IsUnion bName bFields =
+        aName == bName && aFields == bFields
     IsEnum aName == IsEnum bName = aName == bName
     IsIncomplete aName == IsIncomplete bName = aName == bName
     _ == _ = False
@@ -2860,8 +2868,8 @@ declaredNames :: CType -> Set.Set String
 declaredNames (IsFunc retTy args _) =
     Set.unions (map declaredNames (retTy : map snd args))
 declaredNames (IsPtr _ ty) = declaredNames ty
-declaredNames (IsStruct name fields) = Set.insert name
-    (Set.unions (map (declaredNames . snd) fields))
+declaredNames (IsStruct name fields) = Set.insert name (Set.unions (map (declaredNames . snd) fields))
+declaredNames (IsUnion name fields) = Set.insert name (Set.unions (map (declaredNames . snd) fields))
 declaredNames (IsEnum name) = Set.singleton name
 declaredNames (IsIncomplete ident) = Set.singleton (identToString ident)
 declaredNames _ = Set.empty
@@ -2888,8 +2896,8 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     where
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
-toRustType (IsStruct name _fields) = Rust.TypeName name
-toRustType (IsUnion name _fields) = Rust.TypeName name
+toRustType (IsStruct name _) = Rust.TypeName name
+toRustType (IsUnion name _) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
 toRustType (IsIncomplete ident) = Rust.TypeName (identToString ident)
 ```
